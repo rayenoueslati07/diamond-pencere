@@ -1,26 +1,32 @@
 (function () {
   'use strict';
 
-  var DESKTOP = { dir: 'media/d/', count: 359 };
-  var MOBILE = { dir: 'media/m/', count: 180 }; // every second frame of the 359 frame master
-  var isMobile = window.matchMedia('(max-width: 700px)').matches;
+  // Frame sets (AVIF). The master film has 359 frames; the desktop set keeps every 2nd,
+  // the phone set keeps every 4th and is pre-cropped to portrait around each shot's subject.
+  var DESKTOP = { dir: 'media/f/', count: 180 };
+  var MOBILE = { dir: 'media/fm/', count: 90 };
+  var MASTER = 359;
+
+  var conn = navigator.connection || {};
+  var lowData = conn.saveData || /(^|-)(2g|3g)$/.test(conn.effectiveType || '');
+  var isMobile = window.matchMedia('(max-width: 700px)').matches || lowData;
   var set = isMobile ? MOBILE : DESKTOP;
   var N = set.count;
-  var MASTER = 359;
+  var WINDOW = isMobile ? 10 : 12; // decoded bitmaps kept around the current frame
 
   // one entry per shot in the film (cut frames 0, 48, 108, 156, 228, 288 of the master)
   var STEPS = [
-    { fx: 0.36, at: 0,   rail: 'Üretim',        title: 'Üretim',        desc: 'Pencere ve kapılar kendi fabrikamızda, üretim hattında hazırlanır ve kontrolden geçer.' },
-    { fx: 0.55, at: 48,  rail: 'Yükleme',       title: 'Yükleme',       desc: 'Hazır ürünler koruyucu filmle sarılır ve özenle tırlara yüklenir.' },
-    { fx: 0.40, at: 108, rail: 'Sevkiyat',      title: 'Sevkiyat',      desc: 'Kendi lojistik ekibimizle ürünler şantiyeye ulaştırılır.' },
-    { fx: 0.72, at: 156, rail: 'Montaj',        title: 'Montaj',        desc: 'Ekibimiz pencereleri vinçle kata taşır ve açıklığa yerleştirir.' },
-    { fx: 0.28, at: 228, rail: 'Hassas montaj', title: 'Hassas montaj', desc: 'Çerçeve su terazisiyle hizalanır, ankrajla sabitlenir, boşluklar köpükle yalıtılır.' },
-    { fx: 0.50, at: 288, rail: 'Teslim',        title: 'Teslim',        desc: 'Proje tamamlanır, bina Diamond sistemleriyle teslim edilir.' }
+    { at: 0,   rail: 'Üretim',        title: 'Üretim',        desc: 'Pencere ve kapılar kendi fabrikamızda, üretim hattında hazırlanır ve kontrolden geçer.' },
+    { at: 48,  rail: 'Yükleme',       title: 'Yükleme',       desc: 'Hazır ürünler koruyucu filmle sarılır ve özenle tırlara yüklenir.' },
+    { at: 108, rail: 'Sevkiyat',      title: 'Sevkiyat',      desc: 'Kendi lojistik ekibimizle ürünler şantiyeye ulaştırılır.' },
+    { at: 156, rail: 'Montaj',        title: 'Montaj',        desc: 'Ekibimiz pencereleri vinçle kata taşır ve açıklığa yerleştirir.' },
+    { at: 228, rail: 'Hassas montaj', title: 'Hassas montaj', desc: 'Çerçeve su terazisiyle hizalanır, ankrajla sabitlenir, boşluklar köpükle yalıtılır.' },
+    { at: 288, rail: 'Teslim',        title: 'Teslim',        desc: 'Proje tamamlanır, bina Diamond sistemleriyle teslim edilir.' }
   ];
 
   var film = document.getElementById('film');
   var canvas = document.getElementById('canvas');
-  var ctx = canvas.getContext('2d');
+  var ctx = canvas.getContext('2d', { alpha: false });
   var caption = document.getElementById('caption');
   var capTitle = document.getElementById('capTitle');
   var capDesc = document.getElementById('capDesc');
@@ -31,7 +37,6 @@
   var bar = document.getElementById('loaderBar');
   var txt = document.getElementById('loaderTxt');
 
-  // build step rail
   STEPS.forEach(function (s) {
     var li = document.createElement('li');
     li.textContent = s.rail;
@@ -39,41 +44,69 @@
   });
   var railItems = rail.children;
 
-  var imgs = new Array(N);
-  var loaded = 0;
+  var imgs = new Array(N);      // encoded images, filled by the loader
+  var ready = new Array(N);     // true once an image has finished downloading
+  var bmps = {};                // decoded ImageBitmaps for frames near the playhead
+  var pending = {};
   var cur = 0, target = 0, drawn = -1;
   var stepIdx = -1;
-  var focus = 0.5; // horizontal crop focus, matters on tall (phone) screens
-  var dpr = Math.min(window.devicePixelRatio || 1, isMobile ? 1.5 : 1.75);
+  var dpr = Math.min(window.devicePixelRatio || 1, isMobile ? 1.5 : 1.25);
+  var running = false;
 
   function pad(n) { return ('0000' + n).slice(-4); }
 
+  // ---------- drawing ----------
   function resize() {
     var w = canvas.clientWidth, h = canvas.clientHeight;
     canvas.width = Math.round(w * dpr);
     canvas.height = Math.round(h * dpr);
     drawn = -1;
-    draw(Math.round(cur));
+    kick();
+  }
+
+  function pickSource(i) {
+    if (bmps[i]) return bmps[i];
+    if (ready[i]) return imgs[i];
+    for (var k = 1; k < N; k++) {           // nearest frame that is already available
+      var a = i - k, b = i + k;
+      if (a >= 0 && (bmps[a] || ready[a])) return bmps[a] || imgs[a];
+      if (b < N && (bmps[b] || ready[b])) return bmps[b] || imgs[b];
+    }
+    return null;
   }
 
   function draw(i) {
-    var im = imgs[i];
-    if (!im || !im.complete || !im.naturalWidth) {
-      im = null;
-      for (var k = 1; k < N; k++) {
-        var a = imgs[i - k], b = imgs[i + k];
-        if (a && a.complete && a.naturalWidth) { im = a; break; }
-        if (b && b.complete && b.naturalWidth) { im = b; break; }
-      }
-      if (!im) return;
-    }
+    var src = pickSource(i);
+    if (!src) return false;
+    var sw = src.naturalWidth || src.width, sh = src.naturalHeight || src.height;
     var cw = canvas.width, ch = canvas.height;
-    var s = Math.max(cw / im.naturalWidth, ch / im.naturalHeight);
-    var dw = im.naturalWidth * s, dh = im.naturalHeight * s;
-    ctx.drawImage(im, (cw - dw) * focus, (ch - dh) / 2, dw, dh);
+    var s = Math.max(cw / sw, ch / sh);
+    var dw = sw * s, dh = sh * s;
+    ctx.drawImage(src, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
     drawn = i;
+    return true;
   }
 
+  // keep decoded bitmaps only for frames near the playhead (memory + no decode jank)
+  function ensureWindow(center) {
+    for (var j = Math.max(0, center - WINDOW); j <= Math.min(N - 1, center + WINDOW); j++) {
+      if (bmps[j] || pending[j] || !ready[j]) continue;
+      (function (k) {
+        pending[k] = true;
+        createImageBitmap(imgs[k]).then(function (b) {
+          pending[k] = false;
+          if (Math.abs(k - Math.round(cur)) > WINDOW + 6) { b.close(); return; }
+          bmps[k] = b;
+          if (k === Math.round(cur)) { drawn = -1; kick(); }
+        }, function () { pending[k] = false; });
+      })(j);
+    }
+    for (var key in bmps) {
+      if (Math.abs(+key - center) > WINDOW + 6) { bmps[key].close(); delete bmps[key]; }
+    }
+  }
+
+  // ---------- scroll to frame ----------
   function progress() {
     var r = film.getBoundingClientRect();
     var total = film.offsetHeight - window.innerHeight;
@@ -100,64 +133,98 @@
     setTimeout(apply, 260);
   }
 
+  // The loop only runs while something is moving; it stops by itself when idle.
+  function kick() {
+    if (running) return;
+    running = true;
+    requestAnimationFrame(tick);
+  }
+
   function tick() {
     var p = progress();
     target = p * (N - 1);
-    cur += (target - cur) * 0.16;
-    if (Math.abs(target - cur) < 0.01) cur = target;
+    cur += (target - cur) * 0.2;
+    if (Math.abs(target - cur) < 0.02) cur = target;
     var i = Math.round(cur);
+    ensureWindow(i);
     if (i !== drawn) draw(i);
 
     setStep(p);
-    if (stepIdx > -1) {
-      var tf = STEPS[stepIdx].fx;
-      if (Math.abs(tf - focus) > 0.003) { focus += (tf - focus) * 0.1; drawn = -1; }
-    }
     hint.style.opacity = p > 0.02 ? '0' : '1';
-
     var e = Math.max(0, Math.min(1, (p - 0.915) / 0.06));
     end.style.opacity = e;
     end.classList.toggle('on', e > 0.5);
     var fade = e > 0 ? String(Math.max(0, 1 - e * 1.8)) : '1';
     caption.style.opacity = fade;
     rail.style.opacity = fade;
-    requestAnimationFrame(tick);
+
+    if (cur !== target || drawn !== i) requestAnimationFrame(tick);
+    else running = false;
   }
+
+  // ---------- loading ----------
+  var gateTarget = 0, gateLoaded = 0, totalLoaded = 0, opened = false;
 
   function finishLoad() {
+    if (opened) return;
+    opened = true;
     loader.classList.add('done');
     document.documentElement.style.overflow = '';
+    drawn = -1;
+    kick();
   }
 
-  function onLoad() {
-    loaded++;
-    var pct = Math.round((loaded / N) * 100);
-    bar.style.width = pct + '%';
-    txt.textContent = 'Yükleniyor ' + pct + '%';
-    if (loaded === 1) resize();
-    // open the page once about a third of the frames are in; the rest keep loading
-    // while the nearest loaded frame is drawn for anything not yet fetched
-    if (loaded >= Math.ceil(N * 0.34) && !loader.classList.contains('done')) { draw(0); setTimeout(finishLoad, 150); }
-    if (loaded >= N) draw(Math.round(cur));
-  }
-
-  document.documentElement.style.overflow = 'hidden';
-  for (var i = 0; i < N; i++) {
+  function loadOne(i, isGate, done) {
     var im = new Image();
     im.decoding = 'async';
-    im.onload = onLoad;
-    im.onerror = onLoad;
-    im.src = set.dir + pad(i + 1) + '.webp';
+    im.onload = function () {
+      var fin = function () {
+        ready[i] = true; totalLoaded++;
+        if (isGate) {
+          gateLoaded++;
+          var pct = Math.round((gateLoaded / gateTarget) * 100);
+          bar.style.width = pct + '%';
+          txt.textContent = 'Yükleniyor ' + pct + '%';
+          if (gateLoaded === 1) resize();
+          if (gateLoaded >= gateTarget) finishLoad();
+        }
+        if (i === Math.round(cur)) { drawn = -1; }
+        kick();
+        done();
+      };
+      fin(); // decoding happens off-thread later, only for frames near the playhead (createImageBitmap)
+    };
+    im.onerror = function () { if (isGate) { gateLoaded++; if (gateLoaded >= gateTarget) finishLoad(); } done(); };
+    im.src = set.dir + pad(i + 1) + '.avif';
     imgs[i] = im;
   }
+
+  // order: every 4th frame first (so scrubbing works everywhere), then 2nd, then the rest
+  var order = [], coarse = 0, k;
+  for (k = 0; k < N; k += 4) { order.push(k); coarse++; }
+  for (k = 2; k < N; k += 4) order.push(k);
+  for (k = 1; k < N; k += 2) order.push(k);
+  gateTarget = coarse;
+
+  document.documentElement.style.overflow = 'hidden';
+  var CONC = 6, pos = 0;
+  function pump() {
+    while (pos < order.length && CONC > 0) {
+      var idx = order[pos], gate = pos < coarse;
+      pos++; CONC--;
+      loadOne(idx, gate, function () { CONC++; pump(); });
+    }
+  }
+  pump();
   // never trap the visitor behind the loader
-  setTimeout(function () { if (!loader.classList.contains('done')) finishLoad(); }, 25000);
+  setTimeout(finishLoad, 20000);
 
   window.addEventListener('resize', resize);
   window.addEventListener('load', resize);
-  requestAnimationFrame(tick);
+  window.addEventListener('scroll', kick, { passive: true });
+  kick();
 
-  // reveal on scroll
+  // ---------- page behaviour ----------
   var io = ('IntersectionObserver' in window) ? new IntersectionObserver(function (es) {
     es.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } });
   }, { threshold: 0.12 }) : null;
@@ -166,17 +233,16 @@
     if (io) io.observe(el); else el.classList.add('in');
   });
 
-  // counters
   var cio = ('IntersectionObserver' in window) ? new IntersectionObserver(function (es) {
     es.forEach(function (e) {
       if (!e.isIntersecting) return;
       var el = e.target, to = +el.getAttribute('data-to'), t0 = performance.now(), dur = 1500;
       var plus = el.getAttribute('data-plus'), pct = el.getAttribute('data-pct');
       (function step(t) {
-        var k = Math.min(1, (t - t0) / dur);
-        var v = Math.round(to * (1 - Math.pow(1 - k, 3)));
-        el.textContent = (pct ? '%' : '') + v + (plus && k === 1 ? '+' : '');
-        if (k < 1) requestAnimationFrame(step);
+        var kk = Math.min(1, (t - t0) / dur);
+        var v = Math.round(to * (1 - Math.pow(1 - kk, 3)));
+        el.textContent = (pct ? '%' : '') + v + (plus && kk === 1 ? '+' : '');
+        if (kk < 1) requestAnimationFrame(step);
       })(t0);
       cio.unobserve(el);
     });
